@@ -29,17 +29,24 @@
 | 工具协议 | LangChain `@tool`（自动生成 JSON Schema 注入模型） |
 | 配置 | pydantic-settings（`AGENT_` 前缀环境变量 + .env） |
 | 网络 | requests（超时 + 指数退避重试） |
+| 限流 | 自研令牌桶（RPM 次数桶 + TPM token 桶，线程安全） |
+| HTTP API | FastAPI + Uvicorn（对话 / 健康检查 / 指标三端点） |
 
 ### 分层结构
 
 ```
 langgraph-react-agent/
 ├── main.py                    # CLI 入口（单次提问 / 交互式对话）
+├── serve.py                   # HTTP API 启动入口（uvicorn）
 ├── config/settings.py         # 集中配置 + 启动即校验（fail-fast）
 ├── core/
-│   ├── exceptions.py          # 统一异常体系（AgentError / ToolExecutionError 等）
+│   ├── exceptions.py          # 统一异常体系（AgentError / ToolExecutionError / RateLimitError 等）
 │   ├── logging.py             # 日志（控制台 + 滚动文件双输出）
-│   └── llm.py                 # OpenAI 兼容 LLM 客户端工厂
+│   ├── llm.py                 # LLM 统一调用入口：限流预扣 + 耗时/token 计量 + 结算校准
+│   ├── ratelimit.py           # 令牌桶限流器（LLM RPM/TPM 双桶 + 线程安全）
+│   └── retry.py               # 指数退避重试
+├── api/
+│   └── server.py              # FastAPI 接口层（/api/ask、/api/health、/api/metrics + 每IP限流）
 ├── tools/
 │   ├── base.py                # 工具注册表（新增工具无需改图代码）
 │   ├── calculator.py          # 安全计算器（AST 白名单，防代码注入）
@@ -49,6 +56,12 @@ langgraph-react-agent/
 │   ├── state.py               # 图状态（messages + add_messages 累积轨迹）
 │   ├── prompts.py             # ReAct 系统提示词
 │   └── graph.py               # ReAct 图构建 + 思考链日志 + 运行入口
+├── memory/
+│   ├── db.py                  # SQLite 连接与建表
+│   ├── short_term.py          # 短期会话记忆（Q/A 对，线程安全）
+│   ├── long_term.py           # 长期跨会话记忆（LLM 提炼 + 去重入库）
+│   └── repository.py          # 记忆统一入口
+├── tests/                     # 单元测试（限流器 / token 估算 / 计量，无需网络）
 ├── requirements.txt
 └── .env.example
 ```
@@ -122,9 +135,77 @@ finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息�
 全流程可审计，覆盖：会话生命周期（创建/复用/完成）、短期记忆加载、长期记忆注入与提炼、
 模型思考、工具选择、工具执行与耗时、失败重试、上限收敛、任务终止、最终答案。
 
+### 接口限流与 LLM 计量（成本控制）
+
+生产环境中，LLM 调用是有成本的（token 计费），接口也必须防滥用。本项目内置两层防护：
+
+**1. LLM 调用限流（`core/ratelimit.py`）**
+
+- **令牌桶算法**：桶按固定速率补充、允许突发、长期平均受限；
+- **双桶控制**：RPM（每分钟调用次数）+ TPM（每分钟 token 消耗），任一超限即等待；
+- **估算预扣 + 实际结算**：调用前按字符数估算 token 预扣，返回后按 API 实际
+  `token_usage` 校准桶偏差（估算多了返还、少了补扣），长期统计精确；
+- 每次调用打印结构化日志：`[LLM] <caller> 耗时 x.xxs | prompt=.. completion=.. total=..`。
+
+**2. HTTP 接口限流（`api/server.py`）**
+
+- 按**客户端 IP** 各维护一个令牌桶，超限返回 HTTP **429** + 友好提示；
+- 突发桶容量 `AGENT_API_RATE_LIMIT_BURST`，长期速率 `AGENT_API_RATE_LIMIT_RPM`；
+- 超过 1000 个 IP 自动清空防内存泄漏。
+
+**3. LLM 用量统计（`GET /api/metrics`）**
+
+进程内累计所有调用的耗时与 token，按调用方（agent / finalize / memory_extract）分组：
+`total_calls / total_errors / total_duration_sec / total_tokens / avg_duration_sec / by_caller`，
+可直接对接 Prometheus 等监控。
+
 ---
 
-## 三、内置工具
+## 三、HTTP API 接口
+
+启动后（默认 `0.0.0.0:8000`）提供三个端点：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/ask` | POST | 对话接口：question（必填 1-2000 字）+ session_id（可选，续聊） |
+| `/api/health` | GET | 健康检查：服务状态 + 版本 + LLM 限流器状态 |
+| `/api/metrics` | GET | LLM 用量统计：耗时 / token / 调用方分组 |
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"计算 12 的平方","session_id":"demo"}'
+```
+
+响应示例：
+
+```json
+{
+  "answer": "**12 的平方等于 144**（12 × 12 = 144）。",
+  "session_id": "demo",
+  "tool_calls": 1,
+  "memory_new": 0,
+  "aborted": false,
+  "chain": [
+    {"node": "agent", "summary": "思考后决定调用工具: calculator"},
+    {"node": "tools", "summary": "工具 calculator 返回: 144"}
+  ],
+  "usage": {
+    "total_calls": 3, "total_errors": 0,
+    "total_duration_sec": 2.515, "total_tokens": 2724,
+    "by_caller": {"agent": {"count": 2, "total_duration": 1.67, "total_tokens": 2413, "errors": 0}}
+  }
+}
+```
+
+**异常映射**：接口限流 → `429`；LLM 限流等待超时 → `429`（上游繁忙，可重试）；
+LLM 上游异常 → `502`（Bad Gateway）；其余未知错误 → `500`。
+
+---
+
+## 四、内置工具
 
 | 工具 | 能力 | 关键实现 |
 |---|---|---|
@@ -134,7 +215,7 @@ finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息�
 
 ---
 
-## 四、依赖列表
+## 五、依赖列表
 
 | 依赖 | 版本要求 | 用途 |
 |---|---|---|
@@ -144,10 +225,12 @@ finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息�
 | `pydantic` | >=2.0 | 数据模型 |
 | `pydantic-settings` | >=2.0 | 配置加载（.env / 环境变量） |
 | `requests` | >=2.31 | 网络搜索 HTTP 客户端 |
+| `fastapi` | >=0.110 | HTTP API 框架（可选，启动 serve.py 时需要） |
+| `uvicorn` | >=0.27 | ASGI 服务器（可选） |
 
 ---
 
-## 五、环境说明
+## 六、环境说明
 
 - **Python**：3.10+
 - **LLM 网关**：任意 OpenAI 兼容服务（DeepSeek / OpenAI / 通义 / vLLM / OneAPI 等）
@@ -156,7 +239,7 @@ finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息�
 
 ---
 
-## 六、启动步骤
+## 七、启动步骤
 
 ```bash
 # 1. 克隆/进入项目，创建虚拟环境
@@ -186,6 +269,13 @@ python main.py --question "..." --log-level DEBUG
 python main.py --question "我的专业是软件工程" --session my-session   # 指定会话
 python main.py --question "还记得我专业吗？" --session my-session      # 续聊：自动加载历史+长期记忆
 python main.py --list-sessions                                         # 查看历史会话
+
+# 7. 启动 HTTP API 服务（默认 0.0.0.0:8000）
+python serve.py                          # 或：uvicorn serve:app --host 0.0.0.0 --port 8000
+python serve.py --port 9000 --reload     # 指定端口 / 开发热重载
+
+# 8. 运行单元测试（无需网络）
+python -m pytest tests/ -v               # 需先 pip install pytest
 ```
 
 ### 关键配置（.env）
@@ -202,11 +292,16 @@ python main.py --list-sessions                                         # 查看�
 | `AGENT_MEMORY_DB_PATH` | `memory.db` | 记忆数据库路径 |
 | `AGENT_MEMORY_EXTRACT` / `AGENT_MEMORY_INJECT_LIMIT` | `true` / 20 | 长期记忆提炼开关 / 注入条数上限 |
 | `AGENT_SEARCH_ENGINE` | `bing` | bing / wikipedia / duckduckgo |
+| `AGENT_LLM_RATE_LIMIT_RPM` / `TPM` | 60 / 100000 | LLM 每分钟调用次数 / token 上限 |
+| `AGENT_LLM_RATE_LIMIT_TIMEOUT` | 10 | 限流等待超时（秒） |
+| `AGENT_LLM_RATE_LIMIT_BURST_SECONDS` | 30 | LLM 令牌桶突发窗口（秒） |
+| `AGENT_API_HOST` / `AGENT_API_PORT` | 0.0.0.0 / 8000 | HTTP API 监听地址 / 端口 |
+| `AGENT_API_RATE_LIMIT_RPM` / `BURST` | 30 / 10 | 每 IP 每分钟请求数 / 突发容量 |
 | `AGENT_LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
 ---
 
-## 七、Docker 部署
+## 八、Docker 部署
 
 ### 1. 构建镜像
 
@@ -216,14 +311,28 @@ docker build -t react-agent .
 
 > 构建已内置阿里云 PyPI 镜像（`PIP_INDEX_URL`），规避海外源网络不稳定导致的下载失败/哈希校验错误。
 
-### 2. 运行
+### 2. 运行 HTTP API 服务（默认入口）
+
+镜像默认启动 API 服务（监听 8000），适合作为常驻后端集成：
+
+```bash
+docker run -d --name react-agent -p 8000:8000 --env-file .env react-agent
+
+# 验证
+curl http://localhost:8000/api/health
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"计算 2**10","session_id":"demo"}'
+```
+
+### 3. 运行 CLI（覆盖默认命令）
 
 ```bash
 # 单次提问（注入 .env 密钥）
 docker run --rm --env-file .env react-agent python main.py --question "计算 2**10"
 
 # 交互式对话（-it 保持终端）
-docker run --rm -it --env-file .env react-agent
+docker run --rm -it --env-file .env react-agent python main.py
 
 # 多轮会话记忆（挂载数据目录，持久化记忆数据库）
 docker run --rm --env-file .env \
@@ -240,18 +349,24 @@ docker run --rm --env-file .env \
 > 挂载数据目录（`-v 宿主机目录:/app/memory_data`）并设置
 > `AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` 即可持久化对话记忆。
 
-### 3. 使用 Docker Compose（推荐，统一管理）
+### 4. 使用 Docker Compose（推荐，一键部署）
 
 ```bash
-docker compose build
-docker compose run --rm agent python main.py --question "计算 2**10"   # 单次
-docker compose run --rm agent                                           # 交互式
+# 一键构建 + 启动常驻 API 服务（自动重启 + 端口映射 + 记忆持久化）
+docker compose up -d --build
+
+# 验证
+curl http://localhost:8000/api/health
+
+# 备用：CLI 一次性运行
+docker compose run --rm agent python main.py --question "计算 2**10"
 ```
 
 > Compose 已内置：`AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` +
-> 卷挂载 `./memory_data:/app/memory_data`，开箱即用记忆持久化。
+> 卷挂载 `./memory_data:/app/memory_data` + 端口映射 `8000:8000` +
+> `restart: unless-stopped` 自动重启，开箱即用。
 
-### 4. 网络代理说明（重要）
+### 5. 网络代理说明（重要）
 
 Docker 容器的 NAT 出口 IP 可能被搜索引擎（Bing）识别为数据中心/共享 IP 而降级返回结果。
 若容器内 `web_search` 返回不相关内容，把宿主代理透传给容器即可（requests 自动读取）：
@@ -269,7 +384,7 @@ docker run --rm --env-file .env \
 
 ---
 
-## 八、示例效果
+## 九、示例效果
 
 ```
 你: 帮我计算 (1234*56+789)/3 的结果是多少

@@ -71,6 +71,56 @@ class Settings(BaseSettings):
         description="采样温度：0 表示接近确定性输出，适合工具调用场景",
     )
 
+    # ---------- LLM 调用限流与计量 ----------
+    llm_rate_limit_rpm: int = Field(
+        default=60,
+        ge=1,
+        le=10000,
+        description="LLM 每分钟最大调用次数（RPM），令牌桶限流防突发打爆上游",
+    )
+    llm_rate_limit_tpm: int = Field(
+        default=100000,
+        ge=1000,
+        le=10000000,
+        description="LLM 每分钟最大 token 消耗（TPM），按估算预扣+实际结算校准",
+    )
+    llm_rate_limit_timeout: float = Field(
+        default=10.0,
+        ge=0,
+        le=120,
+        description="限流等待超时（秒）：超过则放弃本次调用并抛限流异常",
+    )
+    llm_rate_limit_burst_seconds: float = Field(
+        default=30.0,
+        ge=1,
+        le=3600,
+        description="LLM 令牌桶突发窗口（秒）：桶容量=每秒速率×窗口，允许突发的同时限制长期均值",
+    )
+
+    # ---------- HTTP API（FastAPI 服务） ----------
+    api_host: str = Field(
+        default="0.0.0.0",
+        description="API 服务监听地址（0.0.0.0 允许容器外部访问）",
+    )
+    api_port: int = Field(
+        default=8000,
+        ge=1,
+        le=65535,
+        description="API 服务监听端口",
+    )
+    api_rate_limit_rpm: int = Field(
+        default=30,
+        ge=1,
+        le=10000,
+        description="HTTP 接口每个客户端 IP 每分钟最大请求数（接口级限流）",
+    )
+    api_rate_limit_burst: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="HTTP 接口限流令牌桶突发容量（允许短时突发）",
+    )
+
     # ---------- Agent 运行参数 ----------
     max_iterations: int = Field(
         default=8,

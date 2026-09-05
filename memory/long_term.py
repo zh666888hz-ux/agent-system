@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.exceptions import LLMError
-from core.llm import get_chat_model
+from core.llm import chat_invoke
 from core.logging import get_logger
 from memory.db import _connect, _now
 
@@ -66,7 +66,7 @@ def extract_long_term_memories(question: str, answer: str) -> list[str]:
     prompt = _EXTRACT_PROMPT.format(conversation=conversation)
 
     try:
-        response = get_chat_model().invoke(prompt)
+        response = chat_invoke(prompt, caller="memory_extract")
         content = str(response.content).strip()
     except Exception as exc:
         # 记忆提炼失败不影响主流程：记录后跳过，避免记忆功能拖垮对话

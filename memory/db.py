@@ -80,6 +80,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row          # 行按列名访问
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    # 并发写冲突时最多等待 5s 而不是立即抛 "database is locked"
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 

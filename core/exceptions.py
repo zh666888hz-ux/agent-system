@@ -63,3 +63,7 @@ class RetryExhaustedError(AgentError):
         super().__init__(message, cause)
         self.attempts = attempts
         self.tool_name = tool_name
+
+
+class RateLimitError(AgentError):
+    """限流触发：LLM 调用或 HTTP 接口访问超过速率/配额限制。"""

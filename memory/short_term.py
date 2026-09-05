@@ -35,31 +35,22 @@ logger = get_logger(__name__)
 _MAX_HISTORY_TURNS = 20
 
 
-def _conv_exists(db_path: Path, conv_id: str) -> bool:
-    """判断会话是否存在（用于幂等创建）。"""
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM conversations WHERE id = ?", (conv_id,)
-        ).fetchone()
-    return row is not None
-
-
 def create_conversation(db_path: Path, session_id: Optional[str] = None) -> str:
-    """创建一个新会话，返回会话 ID。
+    """创建（或复用）一个会话，返回会话 ID。线程安全。
 
-    若传入 session_id 且已存在，则直接复用（幂等），用于恢复历史会话。
+    并发安全设计：使用 INSERT OR IGNORE 保证「检查并插入」原子化——
+    高并发下多个请求用同一 session_id 同时调用时，只有首个线程真正插入，
+    其余线程静默忽略（主键已存在），不会触发 UNIQUE 冲突，全部返回同一 ID。
     """
     conv_id = session_id or uuid.uuid4().hex
-    if _conv_exists(db_path, conv_id):
-        logger.info("复用已有会话: %s", conv_id)
-        return conv_id
     now = _now()
     with _connect(db_path) as conn:
         conn.execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
             (conv_id, "", now, now),
         )
-    logger.info("创建会话: %s", conv_id)
+    logger.info("会话就绪: %s（新建或复用）", conv_id)
     return conv_id
 
 

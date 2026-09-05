@@ -16,5 +16,12 @@ pydantic-settings>=2.0
 # ---- 网络搜索 ----
 requests>=2.31
 
+# ---- HTTP API 服务（可选，启动 serve.py / API 容器时需要）----
+fastapi>=0.110
+uvicorn>=0.27
+
+# ---- 测试（可选，运行 tests/ 时需要）----
+# pytest>=7.0
+
 # ---- 可选：dotenv（pydantic-settings 已内置支持，可省略）----
 # python-dotenv>=1.0

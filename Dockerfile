@@ -1,5 +1,5 @@
 # ============================================================
-# LangGraph ReAct Agent 生产镜像
+# LangGraph ReAct Agent 生产镜像（CLI + HTTP API 双入口）
 #
 # 设计要点：
 #   1. 基于 slim 基础镜像，减小体积；
@@ -9,8 +9,10 @@
 #   5. PYTHONUNBUFFERED 保证日志实时输出到 stdout（便于 docker logs 查看）。
 #
 # 构建：docker build -t react-agent .
-# 运行：
-#   docker run --rm -it --env-file .env react-agent                     # 交互式对话
+# 运行（默认 HTTP API，监听 8000）：
+#   docker run -d --name react-agent -p 8000:8000 --env-file .env react-agent
+# 运行（CLI 交互式对话）：
+#   docker run --rm -it --env-file .env react-agent
 #   docker run --rm --env-file .env react-agent python main.py --question "计算 2**10"
 # ============================================================
 
@@ -33,11 +35,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 2) 复制应用代码
 COPY main.py .
+COPY serve.py .
 COPY config/ config/
 COPY core/ core/
 COPY tools/ tools/
 COPY agent/ agent/
 COPY memory/ memory/
+COPY api/ api/
 COPY docs/ docs/
 
 # 3) 创建非 root 运行用户，并赋予日志目录 / 数据目录写权限
@@ -47,5 +51,5 @@ RUN useradd --create-home --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-# 默认命令：展示帮助信息
-CMD ["python", "main.py", "--help"]
+# 默认命令：启动 HTTP API 服务（uvicorn 由 serve.py 内部调用）
+CMD ["python", "serve.py"]

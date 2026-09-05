@@ -40,7 +40,6 @@ LangGraph ReAct Agent 图的构建与运行。
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -50,7 +49,7 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.state import AgentState
 from config.settings import get_settings
 from core.exceptions import LLMError, RetryExhaustedError
-from core.llm import get_chat_model
+from core.llm import chat_invoke
 from core.logging import get_logger
 from core.retry import retry_call
 from memory.repository import MemoryRepository
@@ -70,21 +69,11 @@ _LIMIT_PROMPT = (
 )
 
 
-@lru_cache(maxsize=1)
-def _get_bound_model():
-    """懒加载并缓存「绑定工具」的模型实例。
-
-    设计原因：绑定工具需要读取配置（含 API Key）。若在模块导入时绑定，
-    则未配置 Key 时连 `--help` 都会启动失败。改为首次调用时才绑定，
-    使 CLI 帮助、参数校验等场景无需 Key 也能运行（fail-late 而非 fail-always）。
-    """
-    return get_chat_model().bind_tools(_tools)
-
-
 def _agent_node(state: AgentState) -> dict[str, list]:
     """agent 节点：调用绑定工具的 LLM 生成「回答 或 工具调用请求」。
 
     - 首次进入时注入系统提示词 + 长期记忆上下文（只注入一次，避免历史中重复）。
+    - 统一走 chat_invoke（内部自动限流 + 记录耗时/token + 完整日志）。
     """
     if not any(isinstance(m, SystemMessage) for m in state["messages"]):
         system_content = SYSTEM_PROMPT
@@ -94,7 +83,7 @@ def _agent_node(state: AgentState) -> dict[str, list]:
         state = {**state, "messages": [SystemMessage(content=system_content), *state["messages"]]}
 
     try:
-        response = _get_bound_model().invoke(state["messages"])
+        response = chat_invoke(state["messages"], bind_tools=_tools, caller="agent")
     except Exception as exc:
         logger.exception("agent 节点调用 LLM 失败")
         raise LLMError(f"LLM 调用失败: {exc}", cause=exc) from exc
@@ -204,8 +193,8 @@ def _finalize_node(state: AgentState) -> dict[str, list]:
         msgs[-1] = AIMessage(content=last.content or "", name=last.name)
 
     try:
-        response = get_chat_model().invoke(
-            [*msgs, SystemMessage(content=_LIMIT_PROMPT)]
+        response = chat_invoke(
+            [*msgs, SystemMessage(content=_LIMIT_PROMPT)], caller="finalize"
         )
     except Exception as exc:
         logger.exception("finalize 节点调用 LLM 失败")
@@ -294,7 +283,7 @@ def build_agent():
     graph.add_conditional_edges(
         "tools",
         _after_tools,
-        {"tools": "agent", "abort": "abort"},
+        {"agent": "agent", "abort": "abort"},
     )
     graph.add_edge("finalize", END)
     graph.add_edge("abort", END)
