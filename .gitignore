@@ -25,6 +25,9 @@ Thumbs.db
 *.tmp
 *.bak
 
+# ---- 本地同步脚本（仅本地使用，不入库）----
+sync.ps1
+
 # ---- 本地记忆数据库（含用户对话记录，不入库）----
 memory.db
 memory.db-wal
