@@ -24,6 +24,10 @@ class AgentState(TypedDict):
     Attributes:
         messages: 对话消息序列（用户输入、AI 思考/工具调用、工具结果），
                   由 add_messages Reducer 自动追加。
+        tool_calls: 已执行的工具调用累计次数（防无限循环的核心计数器）。
+                    tools 节点每次执行后自增；agent / finalize 节点不修改它。
+                    当达到 AGENT_MAX_ITERATIONS 上限时，条件边强制结束工具循环。
     """
 
     messages: Annotated[list, add_messages]
+    tool_calls: int

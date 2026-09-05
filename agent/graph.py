@@ -25,6 +25,12 @@ LangGraph ReAct Agent 图的构建与运行。
     - 异常捕获与兜底：
         * 工具执行失败 → ToolNode 把异常包装为 ToolMessage 回传模型，Agent 继续规划；
         * 图整体执行异常 → 在此统一捕获并抛出 LLMError/AgentError，由上层（CLI）兜底。
+
+    - 防无限循环（本模块核心安全设计）：
+        * 状态中维护 tool_calls 计数器，每执行一轮工具调用就自增；
+        * 条件边在「模型又请求调用工具」时先检查计数器是否已达 AGENT_MAX_ITERATIONS 上限，
+          达到则进入 finalize 节点——用「未绑定工具」的模型追加提示后生成最终答案，
+          从根本上杜绝模型反复调用工具造成的死循环（而非依赖框架层 recursion_limit 兜底）。
 """
 
 from __future__ import annotations
@@ -48,6 +54,13 @@ logger = get_logger(__name__)
 
 # 工具列表：模块加载时解析一次（不依赖 API Key）
 _tools = get_tools()
+
+# 达到工具调用上限时，追加给模型的提示：强制收敛、不再调用工具
+_LIMIT_PROMPT = (
+    "注意：本次会话已到达工具调用次数上限，请【立即停止调用任何工具】。"
+    "仅基于已有的工具返回结果和对话历史，直接给出最终答案；"
+    "若信息不足，请如实说明当前已获得的信息与局限。"
+)
 
 
 @lru_cache(maxsize=1)
@@ -91,24 +104,74 @@ def _agent_node(state: AgentState) -> dict[str, list]:
     return {"messages": [response]}
 
 
-def _tools_node(state: AgentState) -> dict[str, list]:
-    """tools 节点：执行模型请求的所有工具调用，结果以 ToolMessage 回填。"""
+def _tools_node(state: AgentState) -> dict[str, Any]:
+    """tools 节点：执行模型请求的所有工具调用，结果以 ToolMessage 回填，并自增计数器。
+
+    Returns:
+        {"messages": [ToolMessage...], "tool_calls": 递增后的累计次数}。
+    """
     last: AIMessage = state["messages"][-1]
-    for tc in getattr(last, "tool_calls", []) or []:
+    calls = getattr(last, "tool_calls", []) or []
+    for tc in calls:
         logger.info("→ 正在执行工具: %s%s", tc["name"], tc.get("args"))
-    return _tool_node.invoke(state)
+
+    result = _tool_node.invoke(state)
+    new_count = state.get("tool_calls", 0) + len(calls)
+    logger.info("工具调用累计次数: %d", new_count)
+    return {"messages": result.get("messages", []), "tool_calls": new_count}
+
+
+def _finalize_node(state: AgentState) -> dict[str, list]:
+    """finalize 节点：达到工具调用上限后强制收敛。
+
+    使用「未绑定工具」的模型（无法再发起工具调用），追加 _LIMIT_PROMPT 提示后，
+    让模型仅基于已有工具结果生成最终答案——确保即使模型此前一直想调用工具，
+    也能在上限处停止并给出结论，不会无限循环。
+
+    注意：达到上限时，最后一条 AI 消息可能带 tool_calls，但这些调用「并未执行」
+    （被条件边拦截），消息序列中不存在对应 ToolMessage。直接将其传给 LLM 会违反
+    「带 tool_calls 的 assistant 消息必须紧跟对应 tool 消息」的协议约束（400 错误），
+    因此必须先清理这条「孤儿」tool_calls 消息，仅保留其思考文本。
+    """
+    limit = get_settings().max_iterations
+    logger.warning("已达到工具调用上限 %d 次，强制进入最终作答（不再允许调用工具）", limit)
+
+    msgs = list(state["messages"])
+    last = msgs[-1]
+    if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+        logger.info("清理未执行的孤儿 tool_calls（%d 个）", len(last.tool_calls))
+        # 重建一条不含 tool_calls 的 AI 消息，保留其思考文本，保证消息协议合法
+        msgs[-1] = AIMessage(content=last.content or "", name=last.name)
+
+    try:
+        response = get_chat_model().invoke(
+            [*msgs, SystemMessage(content=_LIMIT_PROMPT)]
+        )
+    except Exception as exc:
+        logger.exception("finalize 节点调用 LLM 失败")
+        raise LLMError(f"LLM 调用失败（finalize）: {exc}", cause=exc) from exc
+    logger.info("[最终作答(上限触发)] %s", str(response.content).replace("\n", " ")[:200])
+    return {"messages": [response]}
 
 
 def _should_continue(state: AgentState) -> str:
-    """条件边路由：若 AI 最后消息包含工具调用 → 进入 tools；否则结束。
+    """条件边路由：决定 agent 之后的去向。
+
+    路由优先级：
+        1. 模型没有工具调用请求 → "end"（正常给出最终答案）；
+        2. 工具调用累计次数已达上限 → "limit"（强制收敛，防无限循环）；
+        3. 否则 → "tools"（继续执行工具调用）。
 
     Returns:
-        "tools" 或 "end"。
+        "tools" / "limit" / "end"。
     """
     last: AIMessage = state["messages"][-1]
-    if getattr(last, "tool_calls", None):
-        return "tools"
-    return "end"
+    if not getattr(last, "tool_calls", None):
+        return "end"
+    if state.get("tool_calls", 0) >= get_settings().max_iterations:
+        logger.warning("检测到工具调用已达上限 %d 次，强制终止循环", get_settings().max_iterations)
+        return "limit"
+    return "tools"
 
 
 # 工具执行节点：模块加载时构建一次（不依赖 API Key）
@@ -118,6 +181,10 @@ _tool_node = ToolNode(_tools)
 def build_agent():
     """构建并编译 ReAct Agent 图。
 
+    图结构：
+        START → agent ─(tools)→ tools → agent → ... ─(limit)→ finalize → END
+                          └──────(end)─────────── END
+
     Returns:
         langchain.graph.state.CompiledStateGraph: 可被 invoke/stream 的编译图。
     """
@@ -126,11 +193,17 @@ def build_agent():
     # 注册节点
     graph.add_node("agent", _agent_node)
     graph.add_node("tools", _tools_node)
+    graph.add_node("finalize", _finalize_node)
 
-    # 连边：START → agent；agent 条件路由 tools / END；tools 循环回 agent
+    # 连边：START → agent；agent 条件路由 tools/limit/end；tools 循环回 agent
     graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", _should_continue, {"tools": "tools", "end": END})
+    graph.add_conditional_edges(
+        "agent",
+        _should_continue,
+        {"tools": "tools", "limit": "finalize", "end": END},
+    )
     graph.add_edge("tools", "agent")
+    graph.add_edge("finalize", END)
 
     return graph.compile()
 
@@ -167,9 +240,12 @@ def run_agent(question: str, show_chain: bool = True) -> dict[str, Any]:
     logger.info("=" * 60)
 
     # 通过 stream 逐节点消费，记录每一步思考过程
+    # tool_calls=0：工具调用计数器初始值（防无限循环）
+    # recursion_limit：需容纳「每轮 agent+tools ≈ 2 个 superstep」+ 末尾 finalize/END 收尾，
+    #   取 max_iterations*3 + 5，确保达到上限后 finalize 分支能完整走完而不被框架层拦截。
     for step in graph.stream(
-        {"messages": [HumanMessage(content=question)]},
-        config={"recursion_limit": settings.max_iterations * 3},
+        {"messages": [HumanMessage(content=question)], "tool_calls": 0},
+        config={"recursion_limit": settings.max_iterations * 3 + 5},
         stream_mode="updates",
     ):
         for node_name, update in step.items():
@@ -212,5 +288,9 @@ def _summarize_update(node_name: str, update: dict[str, Any]) -> str:
         tool_name = getattr(last, "name", "?")
         content = str(last.content or "")[:120]
         return f"工具 {tool_name} 返回: {content}"
+
+    if node_name == "finalize":
+        content = str(last.content or "")
+        return f"已达工具调用上限，强制最终作答（{len(content)} 字符）"
 
     return f"{node_name} 节点输出"
