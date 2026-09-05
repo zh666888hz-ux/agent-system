@@ -1,111 +1,158 @@
-# 🤖 LangGraph ReAct Agent
+# 🤖 Agent 任务助手（LangGraph ReAct）
 
-> 基于 **LangGraph + OpenAI 兼容 API** 的 ReAct 模式智能体：自动拆解复杂问题、自主选择工具、记录每一步思考过程。内置 **计算器 / 文档总结 / 简单网络搜索** 三个工具。
-
----
-
-## 一、项目简介
-
-本项目实现了一个「思考 → 行动 → 观察」循环（ReAct: Reasoning + Acting）的智能体：
-
-- 用户提出复杂问题，Agent 先拆解为子步骤；
-- 每一步由大模型自主判断**该调用哪个工具**；
-- 工具返回结果后，Agent 继续推理，直到信息充足才给出带依据的最终答案；
-- 整个过程（模型思考、选择的工具、工具结果、最终回答）**逐条记录日志**，可完整审计。
-
-**核心价值**：把「会推理的大模型」与「可执行的外部能力（计算 / 文档 / 网络）」组合起来，
-解决单个模型无法独立完成的问题（如精确计算、读取本地文件、获取实时信息）。
+> 一个**工程级**的 ReAct 模式智能体：自动拆解复杂问题、自主调度工具、记录每一步思考过程。
+> 内置 **计算器 / 文档总结 / 网络搜索** 三个工具，支持**多轮记忆**、**限流计量**、**HTTP API 与 Web 聊天界面**，Docker 一键部署。
 
 ---
 
-## 二、架构设计
+## ✨ 项目亮点
 
-### 技术栈
+- 🧠 **ReAct 思考循环**：`思考 → 行动 → 观察`，大模型自主决定何时调用哪个工具、何时收敛作答
+- 🔧 **工具即插即用**：基于 LangChain `@tool` 注册表，新增工具无需改动图代码（开闭原则）
+- 🛡️ **生产级健壮性**：防无限循环、工具失败自动重试、安全计算器（AST 白名单）、限流计量
+- 🧵 **多轮记忆**：短期会话记忆 + 长期跨会话记忆（SQLite 持久化）
+- 🌐 **Web 界面 + REST API**：内置聊天页面，浏览器零部署即用；`/api/ask` 可集成到任意系统
+- 🐳 **Docker 一键部署**：API 常驻服务 + 记忆持久化 + 非 root 运行
 
-| 类别 | 技术 |
-|---|---|
-| Agent 框架 | LangGraph（StateGraph + 条件回边，实现 ReAct 循环） |
-| LLM | OpenAI 兼容 API（DeepSeek 等，base_url 可切换） |
-| 工具协议 | LangChain `@tool`（自动生成 JSON Schema 注入模型） |
-| 配置 | pydantic-settings（`AGENT_` 前缀环境变量 + .env） |
-| 网络 | requests（超时 + 指数退避重试） |
-| 限流 | 自研令牌桶（RPM 次数桶 + TPM token 桶，线程安全） |
-| HTTP API | FastAPI + Uvicorn（对话 / 健康检查 / 指标三端点） |
+---
 
-### 分层结构
+## 📐 Agent 工作流程
 
-```
-langgraph-react-agent/
-├── main.py                    # CLI 入口（单次提问 / 交互式对话）
-├── serve.py                   # HTTP API 启动入口（uvicorn）
-├── config/settings.py         # 集中配置 + 启动即校验（fail-fast）
-├── core/
-│   ├── exceptions.py          # 统一异常体系（AgentError / ToolExecutionError / RateLimitError 等）
-│   ├── logging.py             # 日志（控制台 + 滚动文件双输出）
-│   ├── llm.py                 # LLM 统一调用入口：限流预扣 + 耗时/token 计量 + 结算校准
-│   ├── ratelimit.py           # 令牌桶限流器（LLM RPM/TPM 双桶 + 线程安全）
-│   └── retry.py               # 指数退避重试
-├── api/
-│   └── server.py              # FastAPI 接口层（/api/ask、/api/health、/api/metrics + 每IP限流）
-├── tools/
-│   ├── base.py                # 工具注册表（新增工具无需改图代码）
-│   ├── calculator.py          # 安全计算器（AST 白名单，防代码注入）
-│   ├── document_summarizer.py # 文档总结（LLM 摘要，编码探测 + 大小限制）
-│   └── web_search.py          # 网络搜索（Bing / Wikipedia / DuckDuckGo 多后端）
-├── agent/
-│   ├── state.py               # 图状态（messages + add_messages 累积轨迹）
-│   ├── prompts.py             # ReAct 系统提示词
-│   └── graph.py               # ReAct 图构建 + 思考链日志 + 运行入口
-├── memory/
-│   ├── db.py                  # SQLite 连接与建表
-│   ├── short_term.py          # 短期会话记忆（Q/A 对，线程安全）
-│   ├── long_term.py           # 长期跨会话记忆（LLM 提炼 + 去重入库）
-│   └── repository.py          # 记忆统一入口
-├── tests/                     # 单元测试（限流器 / token 估算 / 计量，无需网络）
-├── requirements.txt
-└── .env.example
-```
+### 核心思想：ReAct（Reasoning + Acting）
 
-### ReAct 图（LangGraph 状态机）
+传统大模型只能「一次生成答案」；ReAct 让模型在**推理与行动之间循环迭代**，
+直到信息足够才收敛——这是它能完成多步复杂任务的根本原因。
+
+### 工作流程（StateGraph 状态机）
 
 ```
-        ┌──────────────────────────────────────────────────────┐
-        │                                                      │
-        ▼                                                      │
-    ┌───────┐   有工具调用且未达上限   ┌───────┐                │
-    │ agent │────────────────────────▶│ tools │───────────────┘
-    │ (LLM) │                         │ (执行) │
-    └───────┘                         └───────┘
-        │  ▲
-        │  │ 有工具调用但已达次数上限（防无限循环）
-        │  ▼
-        │  ┌───────────┐
-        └─▶│  finalize  │──▶ END（基于已有结果强制收敛作答）
-           └───────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │                                                              │
+        ▼                                                              │
+    ┌────────┐   有工具调用且未达上限      ┌─────────┐                  │
+    │  agent │──────────────────────────▶│  tools  │──────────────────┘
+    │  (LLM) │                           │ (执行)  │
+    └────────┘                           └─────────┘
+        │  ▲                                  │
+        │  │ 有工具调用但已达次数上限           │ 工具结果回填(ToolMessage)
+        │  ▼                                  │
+        │  ┌───────────┐                      │
+        └─▶│ finalize  │◀─────────────────────┘
+           └───────────┘   → END（强制收敛作答）
+        │
         │ 无工具调用（信息充足）
         ▼
       END（输出最终答案）
 ```
 
-- **agent 节点**：把「系统提示词 + 历史消息」交给绑定工具的 LLM，输出回答或工具调用请求；
-- **tools 节点**：执行模型请求的工具调用，结果以 ToolMessage 回填，并自增工具调用计数器；
-- **条件边**：有 `tool_calls` 且计数未达上限 → tools；有 `tool_calls` 但已达上限 → finalize；否则 → END。
+**分步说明：**
 
-### 防无限循环（关键安全设计）
+| 步骤 | 节点 | 做什么 |
+|---|---|---|
+| ① 理解与拆解 | `agent` | 模型读取「系统提示词 + 历史消息 + 长期记忆」，把复杂问题拆成子步骤 |
+| ② 决策调用 | `agent` | 模型输出「思考 + 工具调用请求」（哪个工具、什么参数） |
+| ③ 执行工具 | `tools` | LangGraph 的 ToolNode 执行模型请求的工具，返回结果作为「观察」 |
+| ④ 继续推理 | `agent` | 模型读取工具结果，决定下一步（再调用工具 / 直接作答） |
+| ⑤ 收敛作答 | `END` | 信息充足时模型停止调用工具，输出带依据的最终答案 |
 
-大模型在某些场景下可能陷入「反复调用工具」的循环（如搜索不到满意结果时不断换词重搜）。
-本项目采用**双重保障**：
+**防无限循环双保险**：状态中维护 `tool_calls` 计数器，达到上限强制进入
+`finalize` 节点用「未绑定工具」的模型收敛作答；框架层 `recursion_limit`
+动态放大作为兜底——即使计数器失效，LangGraph 也会在超级步数耗尽时报错而非挂死。
 
-1. **图内计数器（核心）**：状态中维护 `tool_calls` 计数器，每执行一轮工具调用就自增；
-   条件边在模型再次请求调用工具时先检查是否已达 `AGENT_MAX_ITERATIONS` 上限，
-   达到则进入 **finalize 节点**——用「未绑定工具」的模型强制生成最终答案，从根本上终止循环；
-2. **框架层兜底**：`recursion_limit` 按上限动态放大（`max_iterations*3 + 5`），
-   即使计数器逻辑失效，LangGraph 也会在超级步数耗尽时抛错而非无限挂起。
+---
 
-finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息，保证发给 LLM 的消息序列
-符合 OpenAI 工具调用协议（避免 400 错误），并如实告知用户已达上限、基于已有结果作答。
+## 🔧 工具调度原理
 
-### 记忆系统（短期会话记忆 + 长期跨会话记忆）
+### 1. 模型如何"认识"工具？—— 函数调用协议（Function Calling）
+
+LangChain `@tool` 装饰器会自动从**函数签名 + Docstring** 生成 JSON Schema，
+随请求一起注入大模型。模型据此「知道」存在哪些工具、每个工具做什么、参数是什么：
+
+```python
+@tool
+def calculator(expression: str) -> str:
+    """安全计算数学表达式（四则运算、幂、取余、abs/min/max/round/pow）。
+
+    参数:
+        expression: 待计算的数学表达式，如 "2**10"、"15*3+7"
+    """
+    ...
+```
+
+> ⚠️ 因此 **Docstring 质量直接决定工具调用准确率**——它是模型选择工具的「说明书」。
+
+### 2. 谁决定调用？—— 大模型决策
+
+模型在每次 `agent` 节点运行时，根据当前问题自主输出二选一：
+
+- **输出回答** → 无工具调用 → 收敛作答；
+- **输出 tool_calls**（如 `calculator(expression="7**3")`）→ 进入工具执行。
+
+这赋予了 Agent 与传统流水线本质不同的能力：**决策不是写死的，而是每步动态产生**。
+
+### 3. 谁执行？—— LangGraph 的 ToolNode
+
+`tools` 节点遍历模型请求的工具调用列表，逐一执行真实函数，结果以
+`ToolMessage` 回填到图状态，供下一轮 `agent` 读取。
+
+### 4. 工具注册表 —— 开闭原则
+
+```python
+# tools/base.py —— 新增工具只需在 get_tools() 里追加一行
+def get_tools() -> list[BaseTool]:
+    return [calculator, document_summarizer, web_search]
+```
+
+Agent 图只依赖这一个接口，**加工具不改图、不加路由逻辑**。
+
+### 5. 工具执行保障
+
+| 机制 | 说明 |
+|---|---|
+| 失败自动重试 | 指数退避（1s→2s→4s...），默认重试 2 次 |
+| 连续失败终止 | 超过上限进入 `abort` 节点，生成**友好提示**而非裸堆栈 |
+| 安全计算器 | AST 白名单求值，拦截 `__import__`/`open`/属性访问等注入攻击 |
+| 耗时日志 | 每次工具调用记录执行耗时，可审计 |
+
+---
+
+## 🆚 Agent 能做什么传统 RAG 做不到的事？
+
+RAG（检索增强生成）的范式是：**检索 → 拼接上下文 → 单轮生成**。
+它擅长「从给定文档库中找事实」，但本质是**一次性的问答**；
+而本项目的 Agent 是**多步执行器**，两者解决的是不同维度的问题。
+
+| 维度 | 传统 RAG | 本项目 Agent |
+|---|---|---|
+| 处理流程 | 单轮：检索 → 拼上下文 → 生成 | 多轮：思考 → 调用工具 → 观察 → 再思考 |
+| 多步组合任务 | ❌ 一次生成，无法中途调整 | ✅ 自动拆解，分步执行（如"先搜定义再算结果"） |
+| 精确计算 | ❌ 只能找现成答案 | ✅ 调用计算器精确求值 |
+| 实时信息 | ❌ 依赖静态文档库 | ✅ 联网搜索，获取最新事实 |
+| 交互式总结 | ❌ 检索文档片段 | ✅ 读取文件/长文本，LLM 生成结构化摘要 |
+| 结果验证迭代 | ❌ 错了就错 | ✅ 根据观察结果换策略重试 |
+| 跨工具组合 | ❌ 单一检索通道 | ✅ 计算 + 搜索 + 总结任意编排 |
+| 失败处理 | ❌ 返回空/幻觉 | ✅ 重试、降级、如实告知、友好终止 |
+| 可审计性 | ❌ 黑盒一次调用 | ✅ 思考链逐步留痕，可回放 |
+
+**典型 Agent 专属任务：**
+
+```
+你: 请搜索一下什么是强化学习，然后计算 15 的平方与 3 的立方的和
+
+[思考] 分两步处理：先搜索定义，同时计算 15² 与 3³。
+[选择工具] web_search + calculator
+[工具] calculator 返回: 252
+[思考] 第一次搜索结果不相关，换更聚焦的关键词重新搜索…
+[工具] web_search 返回: 命中 5 条
+[选择工具] calculator, 参数={'expression': '225 + 27'}   # 二次验证
+[给出答案] 强化学习是…；15² + 3³ = 252（经 calculator 两次验证）
+```
+
+这类「检索 + 计算 + 验证」的组合，RAG 单轮范式无法完成。
+
+---
+
+## 🧵 记忆系统（短期 + 长期）
 
 对话记忆用 SQLite（零配置单文件，标准库实现）持久化，三张表：
 
@@ -115,63 +162,28 @@ finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息�
 | `messages` | 短期记忆 | 每轮「用户提问 + Agent 回答」Q/A 对 |
 | `long_term_memories` | 长期记忆 | 跨会话的持久事实（用户偏好 / 关注领域等） |
 
-- **短期记忆**：同一 `session_id` 连续提问时，自动加载历史 Q/A 对拼入上下文，实现多轮对话记忆；
-- **长期记忆**：每轮对话结束后，用 LLM 提炼「值得长期记住的信息」（记忆巩固），去重后入库；
-  新会话开始时自动注入系统提示词，让 Agent 冷启动也能"记得"用户是谁；
-- **CLI 支持**：`--session <id>` 指定会话续聊、`--list-sessions` 查看历史会话。
-
-### 工具失败自动重试
-
-生产环境中工具调用常因网络抖动 / 远端临时故障而失败。本项目内置重试机制：
-
-- 工具调用失败后按 `AGENT_TOOL_MAX_RETRIES`（默认 2 次）自动重试；
-- 重试间隔**指数退避**（`AGENT_TOOL_RETRY_BACKOFF` 基数：1s → 2s → 4s ...），给远端恢复时间；
-- **连续失败终止**：超过重试上限后进入 abort 节点，生成**友好提示**（含失败工具名、
-  已尝试次数、可能原因、建议），而不是抛裸堆栈或让 Agent 无限重试；
-- 每次失败 / 重试 / 终止都记录详细日志，便于排查。
-
-### 完整运行日志
-
-全流程可审计，覆盖：会话生命周期（创建/复用/完成）、短期记忆加载、长期记忆注入与提炼、
-模型思考、工具选择、工具执行与耗时、失败重试、上限收敛、任务终止、最终答案。
-
-### 接口限流与 LLM 计量（成本控制）
-
-生产环境中，LLM 调用是有成本的（token 计费），接口也必须防滥用。本项目内置两层防护：
-
-**1. LLM 调用限流（`core/ratelimit.py`）**
-
-- **令牌桶算法**：桶按固定速率补充、允许突发、长期平均受限；
-- **双桶控制**：RPM（每分钟调用次数）+ TPM（每分钟 token 消耗），任一超限即等待；
-- **估算预扣 + 实际结算**：调用前按字符数估算 token 预扣，返回后按 API 实际
-  `token_usage` 校准桶偏差（估算多了返还、少了补扣），长期统计精确；
-- 每次调用打印结构化日志：`[LLM] <caller> 耗时 x.xxs | prompt=.. completion=.. total=..`。
-
-**2. HTTP 接口限流（`api/server.py`）**
-
-- 按**客户端 IP** 各维护一个令牌桶，超限返回 HTTP **429** + 友好提示；
-- 突发桶容量 `AGENT_API_RATE_LIMIT_BURST`，长期速率 `AGENT_API_RATE_LIMIT_RPM`；
-- 超过 1000 个 IP 自动清空防内存泄漏。
-
-**3. LLM 用量统计（`GET /api/metrics`）**
-
-进程内累计所有调用的耗时与 token，按调用方（agent / finalize / memory_extract）分组：
-`total_calls / total_errors / total_duration_sec / total_tokens / avg_duration_sec / by_caller`，
-可直接对接 Prometheus 等监控。
+- **短期记忆**：同一 `session_id` 连续提问，自动加载历史 Q/A 拼入上下文；
+- **长期记忆**：每轮对话后 LLM 提炼「值得长期记住的信息」，去重入库；
+  新会话自动注入系统提示词，让 Agent 冷启动也"记得"用户是谁。
 
 ---
 
-## 三、HTTP API 接口
+## 🌐 界面与接口
 
-启动后（默认 `0.0.0.0:8000`）提供三个端点：
+### Web 聊天界面（内置）
+
+启动 API 后浏览器访问 **`http://localhost:8000/`** 即可使用聊天页面：
+左侧会话管理（新建/切换，本地持久化），右侧对话区可展开查看
+**思考链、工具调用次数、token 用量**。
+
+### REST API
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/ask` | POST | 对话接口：question（必填 1-2000 字）+ session_id（可选，续聊） |
-| `/api/health` | GET | 健康检查：服务状态 + 版本 + LLM 限流器状态 |
+| `/` | GET | 内置 Web 聊天页面 |
+| `/api/ask` | POST | 对话接口：`question`（必填）+ `session_id`（可选，续聊） |
+| `/api/health` | GET | 健康检查：服务状态 + 限流器状态 |
 | `/api/metrics` | GET | LLM 用量统计：耗时 / token / 调用方分组 |
-
-请求示例：
 
 ```bash
 curl -X POST http://localhost:8000/api/ask \
@@ -179,212 +191,147 @@ curl -X POST http://localhost:8000/api/ask \
   -d '{"question":"计算 12 的平方","session_id":"demo"}'
 ```
 
-响应示例：
+响应含答案、思考链 `chain`、工具调用次数、token 用量 `usage`。
+**异常映射**：接口/LLM 限流 → `429`；LLM 上游异常 → `502`；未知错误 → `500`。
 
-```json
-{
-  "answer": "**12 的平方等于 144**（12 × 12 = 144）。",
-  "session_id": "demo",
-  "tool_calls": 1,
-  "memory_new": 0,
-  "aborted": false,
-  "chain": [
-    {"node": "agent", "summary": "思考后决定调用工具: calculator"},
-    {"node": "tools", "summary": "工具 calculator 返回: 144"}
-  ],
-  "usage": {
-    "total_calls": 3, "total_errors": 0,
-    "total_duration_sec": 2.515, "total_tokens": 2724,
-    "by_caller": {"agent": {"count": 2, "total_duration": 1.67, "total_tokens": 2413, "errors": 0}}
-  }
-}
+---
+
+## ⚙️ 工程结构
+
+```
+langgraph-react-agent/
+├── main.py                    # CLI 入口（单次提问 / 交互式对话）
+├── serve.py                   # HTTP API 启动入口（uvicorn）
+├── static/index.html          # 内置 Web 聊天页（零依赖单文件）
+├── config/settings.py         # 集中配置 + 启动即校验（fail-fast）
+├── core/
+│   ├── exceptions.py          # 统一异常体系
+│   ├── logging.py             # 日志（控制台 + 滚动文件双输出）
+│   ├── llm.py                 # LLM 统一入口：限流预扣 + 耗时/token 计量 + 结算校准
+│   ├── ratelimit.py           # 令牌桶限流器（RPM/TPM 双桶，线程安全）
+│   └── retry.py               # 指数退避重试
+├── api/server.py              # FastAPI：/api/ask /api/health /api/metrics + 每IP限流 + 静态托管
+├── tools/
+│   ├── base.py                # 工具注册表（新增工具无需改图）
+│   ├── calculator.py          # 安全计算器（AST 白名单防注入）
+│   ├── document_summarizer.py # 文档总结
+│   └── web_search.py          # 网络搜索（Bing/Wikipedia/DuckDuckGo）
+├── agent/
+│   ├── state.py               # 图状态
+│   ├── prompts.py             # ReAct 系统提示词
+│   └── graph.py               # 图构建 + 思考链日志 + 运行入口
+├── memory/                    # SQLite 记忆系统（短期/长期/仓库）
+├── tests/                     # 单元测试（无需网络）
+├── Dockerfile / docker-compose.yml
+└── .env.example
 ```
 
-**异常映射**：接口限流 → `429`；LLM 限流等待超时 → `429`（上游繁忙，可重试）；
-LLM 上游异常 → `502`（Bad Gateway）；其余未知错误 → `500`。
-
 ---
 
-## 四、内置工具
+## 🚀 快速开始
 
-| 工具 | 能力 | 关键实现 |
-|---|---|---|
-| `calculator` | 数学表达式计算 | AST 白名单安全求值，拦截 `__import__`/`open`/属性访问等注入攻击 |
-| `document_summarizer` | 总结文本/本地文件 | 独立 LLM 调用；自动编码探测；大小限制；超长截断 |
-| `web_search` | 互联网关键词搜索 | 默认 **Bing**（国内直连）；可选 Wikipedia/DuckDuckGo；超时+重试 |
-
----
-
-## 五、依赖列表
-
-| 依赖 | 版本要求 | 用途 |
-|---|---|---|
-| `langgraph` | >=1.0 | ReAct 图构建与执行 |
-| `langchain-core` | >=1.0 | 工具定义（@tool）与消息模型 |
-| `langchain-openai` | >=1.0 | OpenAI 兼容 LLM 客户端 |
-| `pydantic` | >=2.0 | 数据模型 |
-| `pydantic-settings` | >=2.0 | 配置加载（.env / 环境变量） |
-| `requests` | >=2.31 | 网络搜索 HTTP 客户端 |
-| `fastapi` | >=0.110 | HTTP API 框架（可选，启动 serve.py 时需要） |
-| `uvicorn` | >=0.27 | ASGI 服务器（可选） |
-
----
-
-## 六、环境说明
-
-- **Python**：3.10+
-- **LLM 网关**：任意 OpenAI 兼容服务（DeepSeek / OpenAI / 通义 / vLLM / OneAPI 等）
-- **网络**：默认搜索后端 Bing（cn.bing.com）需国内可直连；若使用海外后端需能访问对应站点
-- **密钥**：API Key 通过 `.env` 注入（已被 .gitignore 排除，不入库）
-
----
-
-## 七、启动步骤
+### 方式一：本地运行
 
 ```bash
-# 1. 克隆/进入项目，创建虚拟环境
+# 1. 创建虚拟环境并安装依赖
 cd langgraph-react-agent
 python -m venv .venv
-# Windows: .venv\Scripts\activate | Linux/macOS: source .venv/bin/activate
-
-# 2. 安装依赖
+.venv\Scripts\activate        # Windows；Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. 配置环境变量（必填 API Key）
-cp .env.example .env
-# 编辑 .env，至少填写：
-#   AGENT_OPENAI_API_KEY=sk-xxx
+# 2. 配置环境变量（必填 API Key）
+cp .env.example .env          # 填写 AGENT_OPENAI_API_KEY
+# 任意 OpenAI 兼容网关均可：DeepSeek / OpenAI / 通义 / vLLM / OneAPI
 
-# 4a. 单次提问
+# 3. CLI 单次提问 / 交互对话
 python main.py --question "计算 (1234*56+789)/3"
-
-# 4b. 交互式对话（输入 exit 退出）
 python main.py
 
-# 5. 其他参数
-python main.py --question "..." --no-chain   # 不打印思考链
-python main.py --question "..." --log-level DEBUG
+# 4. 启动 Web 界面 + API（浏览器打开 http://localhost:8000/）
+python serve.py
 
-# 6. 多轮会话记忆
-python main.py --question "我的专业是软件工程" --session my-session   # 指定会话
-python main.py --question "还记得我专业吗？" --session my-session      # 续聊：自动加载历史+长期记忆
-python main.py --list-sessions                                         # 查看历史会话
-
-# 7. 启动 HTTP API 服务（默认 0.0.0.0:8000）
-python serve.py                          # 或：uvicorn serve:app --host 0.0.0.0 --port 8000
-python serve.py --port 9000 --reload     # 指定端口 / 开发热重载
-
-# 8. 运行单元测试（无需网络）
-python -m pytest tests/ -v               # 需先 pip install pytest
+# 5. 运行单元测试
+python -m pytest tests/ -v    # 需先 pip install pytest
 ```
 
-### 关键配置（.env）
+### 方式二：Docker 一键部署（推荐）
+
+```bash
+# 一键构建 + 启动常驻 API（含 Web 界面、端口映射、记忆持久化、自动重启）
+docker compose up -d --build
+
+# 浏览器访问 Web 聊天页
+open http://localhost:8000/
+
+# 或直接调用 API
+curl http://localhost:8000/api/health
+```
+
+> Docker 镜像默认启动 API 服务（监听 8000）；CLI 方式：
+> `docker run --rm --env-file .env react-agent python main.py --question "计算 2**10"`
+
+---
+
+## ⚙️ 关键配置（.env）
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `AGENT_OPENAI_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI 兼容网关地址 |
-| `AGENT_OPENAI_API_KEY` | 必填 | API Key（生产用环境变量注入） |
+| `AGENT_OPENAI_API_KEY` | 必填 | API Key（生产用环境变量注入，不入库） |
 | `AGENT_CHAT_MODEL` | `deepseek-chat` | 对话模型名 |
-| `AGENT_LLM_TIMEOUT` / `AGENT_LLM_MAX_RETRIES` | 60 / 3 | LLM 超时与重试 |
 | `AGENT_MAX_ITERATIONS` | 8 | Agent 最大思考-调用轮数（防死循环） |
-| `AGENT_TOOL_MAX_RETRIES` / `AGENT_TOOL_RETRY_BACKOFF` | 2 / 1.0 | 工具失败重试次数与退避基数 |
+| `AGENT_TOOL_MAX_RETRIES` / `AGENT_TOOL_RETRY_BACKOFF` | 2 / 1.0 | 工具失败重试与退避基数 |
 | `AGENT_MEMORY_ENABLED` | `true` | 是否启用记忆系统 |
 | `AGENT_MEMORY_DB_PATH` | `memory.db` | 记忆数据库路径 |
-| `AGENT_MEMORY_EXTRACT` / `AGENT_MEMORY_INJECT_LIMIT` | `true` / 20 | 长期记忆提炼开关 / 注入条数上限 |
-| `AGENT_SEARCH_ENGINE` | `bing` | bing / wikipedia / duckduckgo |
 | `AGENT_LLM_RATE_LIMIT_RPM` / `TPM` | 60 / 100000 | LLM 每分钟调用次数 / token 上限 |
 | `AGENT_LLM_RATE_LIMIT_TIMEOUT` | 10 | 限流等待超时（秒） |
-| `AGENT_LLM_RATE_LIMIT_BURST_SECONDS` | 30 | LLM 令牌桶突发窗口（秒） |
-| `AGENT_API_HOST` / `AGENT_API_PORT` | 0.0.0.0 / 8000 | HTTP API 监听地址 / 端口 |
+| `AGENT_LLM_RATE_LIMIT_BURST_SECONDS` | 30 | 令牌桶突发窗口（秒） |
+| `AGENT_API_HOST` / `AGENT_API_PORT` | 0.0.0.0 / 8000 | API 监听地址 / 端口 |
 | `AGENT_API_RATE_LIMIT_RPM` / `BURST` | 30 / 10 | 每 IP 每分钟请求数 / 突发容量 |
+| `AGENT_SEARCH_ENGINE` | `bing` | bing / wikipedia / duckduckgo |
 | `AGENT_LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
 ---
 
-## 八、Docker 部署
+## 🏗️ 优化点（已实现的生产级设计）
 
-### 1. 构建镜像
-
-```bash
-docker build -t react-agent .
-```
-
-> 构建已内置阿里云 PyPI 镜像（`PIP_INDEX_URL`），规避海外源网络不稳定导致的下载失败/哈希校验错误。
-
-### 2. 运行 HTTP API 服务（默认入口）
-
-镜像默认启动 API 服务（监听 8000），适合作为常驻后端集成：
-
-```bash
-docker run -d --name react-agent -p 8000:8000 --env-file .env react-agent
-
-# 验证
-curl http://localhost:8000/api/health
-curl -X POST http://localhost:8000/api/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question":"计算 2**10","session_id":"demo"}'
-```
-
-### 3. 运行 CLI（覆盖默认命令）
-
-```bash
-# 单次提问（注入 .env 密钥）
-docker run --rm --env-file .env react-agent python main.py --question "计算 2**10"
-
-# 交互式对话（-it 保持终端）
-docker run --rm -it --env-file .env react-agent python main.py
-
-# 多轮会话记忆（挂载数据目录，持久化记忆数据库）
-docker run --rm --env-file .env \
-  -v "$(pwd)/memory_data:/app/memory_data" \
-  -e AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db \
-  react-agent python main.py --question "我的专业是软件工程" --session my-session
-docker run --rm --env-file .env \
-  -v "$(pwd)/memory_data:/app/memory_data" \
-  -e AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db \
-  react-agent python main.py --question "还记得我专业吗？" --session my-session
-```
-
-> **记忆持久化**：容器内 `memory.db` 默认写在容器文件系统，容器删除即丢失。
-> 挂载数据目录（`-v 宿主机目录:/app/memory_data`）并设置
-> `AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` 即可持久化对话记忆。
-
-### 4. 使用 Docker Compose（推荐，一键部署）
-
-```bash
-# 一键构建 + 启动常驻 API 服务（自动重启 + 端口映射 + 记忆持久化）
-docker compose up -d --build
-
-# 验证
-curl http://localhost:8000/api/health
-
-# 备用：CLI 一次性运行
-docker compose run --rm agent python main.py --question "计算 2**10"
-```
-
-> Compose 已内置：`AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` +
-> 卷挂载 `./memory_data:/app/memory_data` + 端口映射 `8000:8000` +
-> `restart: unless-stopped` 自动重启，开箱即用。
-
-### 5. 网络代理说明（重要）
-
-Docker 容器的 NAT 出口 IP 可能被搜索引擎（Bing）识别为数据中心/共享 IP 而降级返回结果。
-若容器内 `web_search` 返回不相关内容，把宿主代理透传给容器即可（requests 自动读取）：
-
-```bash
-# Windows Docker Desktop：host.docker.internal 指向宿主机
-docker run --rm --env-file .env \
-  -e HTTP_PROXY=http://host.docker.internal:7890 \
-  -e HTTPS_PROXY=http://host.docker.internal:7890 \
-  react-agent python main.py --question "搜索一下什么是深度学习"
-```
-
-即使不配置代理，Agent 的 ReAct 设计也会优雅降级：搜索异常时**如实告知用户、不编造结果**，
-并基于自身知识作答（明确标注信息来源）。
+1. **防无限循环**：图内工具计数器 + 框架 `recursion_limit` 双保险，从根本上杜绝模型陷入死循环
+2. **工具失败自动重试**：指数退避；连续失败进入 `abort` 节点给用户**友好提示**
+3. **安全计算器**：AST 白名单求值，拦截代码注入；搜索/总结均有超时与大小限制
+4. **LLM 成本控制**：令牌桶限流（RPM 次数 + TPM token 双桶），估算预扣 + 实际结算校准
+5. **接口防滥用**：按客户端 IP 独立令牌桶，超限返回 429
+6. **可观测**：每次 LLM 调用打印耗时/token，`/api/metrics` 暴露进程内用量统计
+7. **多轮记忆**：短期会话记忆 + 长期跨会话记忆，SQLite 持久化
+8. **健壮分层**：统一异常体系、集中配置 fail-fast 校验、双输出日志
+9. **安全默认**：API Key 不入库、Docker 非 root 运行、`.env`/`sync.ps1` 被 git 忽略
 
 ---
 
-## 九、示例效果
+## ⚠️ 已知不足与后续改进方向
+
+> 诚实说明当前边界，避免「宣称完成但实际不可用」的坑。
+
+1. **无流式输出（SSE）**：当前 `/api/ask` 一次性返回，长回答等待感明显。
+   改进：FastAPI `StreamingResponse` + 前端 `fetch` 流式渲染（已在路线图）。
+2. **工具串行执行**：模型一次请求多个工具时当前逐个执行。
+   改进：LangGraph `Send` API 支持并行工具调用，可显著加速复合任务。
+3. **长会话 token 成本**：历史消息 + 长期记忆全量注入上下文，会话变长后成本线性上升。
+   改进：滑动窗口截断、历史摘要压缩、记忆按相关性筛选注入。
+4. **接口无鉴权**：目前只有每 IP 限流，无 API Key / JWT 认证。
+   生产暴露公网前必须补充身份认证。
+5. **搜索稳定性依赖外部站点**：Bing 等可能限流/降级。
+   改进：多搜索引擎故障切换 + 结果缓存。
+6. **记忆提炼依赖 LLM**：长期记忆抽取准确性受模型影响，可能误提炼。
+   改进：加置信度阈值 / 人工确认机制。
+7. **单机 SQLite 扩展性有限**：多实例水平扩展需替换为 PostgreSQL / Redis 记忆存储。
+8. **单模型无路由**：复杂/简单任务共用同一模型，成本非最优。
+   改进：按问题复杂度路由到不同规格模型。
+9. **无知识库能力**：本 Agent 定位是「任务执行」而非「知识问答」。
+   若需基于私有文档作答，可新增 `retriever` 工具（向量检索）挂入注册表即可。
+
+---
+
+## 📖 参考示例
 
 ```
 你: 帮我计算 (1234*56+789)/3 的结果是多少
@@ -395,16 +342,15 @@ docker run --rm --env-file .env \
 [给出答案] (1234×56 + 789) ÷ 3 = 23297.666…（约 23297.67）
 ```
 
-复合问题（Agent 自动拆解并**并行调用**工具、失败后**自主重搜**、计算**二次验证**）：
+---
 
-```
-你: 请搜索一下什么是强化学习，然后计算 15 的平方与 3 的立方的和
+## 📦 环境要求
 
-[思考] 分两步处理：先搜索定义，同时计算 15² 与 3³。
-[选择工具] web_search + calculator（并行）
-[工具] calculator 返回: 252
-[思考] 第一次搜索结果不相关，换更聚焦的关键词重新搜索…
-[工具] web_search 返回: 命中 5 条
-[选择工具] calculator, 参数={'expression': '225 + 27'}   # 二次验证
-[给出答案] 强化学习是…；15² + 3³ = 252（经 calculator 两次验证）
-```
+- **Python** 3.10+
+- **LLM 网关**：任意 OpenAI 兼容服务（DeepSeek / OpenAI / 通义 / vLLM / OneAPI 等）
+- **Docker**（可选）：Docker Desktop 或任意 Docker Engine
+- **网络**：默认搜索后端 Bing 需国内可直连；海外后端需能访问对应站点
+
+---
+
+MIT License © 2026 [zh666888hz-ux](https://github.com/zh666888hz-ux)

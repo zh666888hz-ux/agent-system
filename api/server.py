@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agent.graph import run_agent
@@ -35,6 +38,9 @@ from memory.repository import MemoryRepository
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+# 前端静态资源目录：<项目根>/static（index.html 聊天页）
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # 进程内单例：记忆仓库（跨请求复用，内部缓存 SQLite 连接与建表）
 _repository: MemoryRepository | None = None
@@ -82,6 +88,17 @@ app = FastAPI(
     description="LangGraph ReAct 智能体 HTTP 接口：计算器 / 文档总结 / 网络搜索 / 多轮记忆",
     version="1.0.0",
 )
+
+
+# ---------- 前端静态页面 ----------
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    """根路径返回聊天页面（前端由本项目内置，无需额外部署）。"""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+# /static 目录静态资源（CSS/JS/图片等）
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ---------- 请求 / 响应模型 ----------

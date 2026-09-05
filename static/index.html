@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent 任务助手</title>
+<style>
+  /* ========== 全局 ========== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #f5f7fa;
+    --panel: #ffffff;
+    --border: #e5e9f0;
+    --primary: #2563eb;
+    --primary-soft: #eff6ff;
+    --text: #1f2937;
+    --text-sub: #6b7280;
+    --user-bubble: #2563eb;
+    --assistant-bubble: #ffffff;
+    --code-bg: #0f172a;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ========== 左侧会话栏 ========== */
+  #sidebar {
+    width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+  #sidebar header {
+    padding: 16px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  #sidebar header h1 {
+    font-size: 16px;
+    font-weight: 700;
+  }
+  #sidebar header p {
+    font-size: 12px;
+    color: var(--text-sub);
+    margin-top: 4px;
+  }
+  #new-chat-btn {
+    margin: 12px 14px;
+    padding: 9px 0;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  #new-chat-btn:hover { opacity: .88; }
+  #session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+  }
+  .session-item {
+    padding: 10px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 2px;
+  }
+  .session-item:hover { background: var(--primary-soft); }
+  .session-item.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+
+  /* ========== 主聊天区 ========== */
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  #chat-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 14px;
+    color: var(--text-sub);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  #chat-header .title { font-weight: 600; color: var(--text); }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 20px;
+    scroll-behavior: smooth;
+  }
+  .empty-tip {
+    text-align: center;
+    color: var(--text-sub);
+    margin-top: 18vh;
+    font-size: 14px;
+    line-height: 2;
+  }
+  .empty-tip .big { font-size: 22px; color: var(--text); font-weight: 700; }
+
+  .msg {
+    display: flex;
+    margin-bottom: 18px;
+  }
+  .msg.user { justify-content: flex-end; }
+  .msg .avatar {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #fff;
+    margin-right: 10px;
+  }
+  .msg.user .avatar { background: var(--primary); order: 2; margin-right: 0; margin-left: 10px; }
+  .msg.assistant .avatar { background: #10b981; }
+  .bubble {
+    max-width: 76%;
+    padding: 11px 15px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.7;
+    word-break: break-word;
+  }
+  .msg.user .bubble { background: var(--user-bubble); color: #fff; border-top-right-radius: 4px; }
+  .msg.assistant .bubble { background: var(--assistant-bubble); border: 1px solid var(--border); border-top-left-radius: 4px; }
+
+  .bubble pre {
+    background: var(--code-bg);
+    color: #e2e8f0;
+    padding: 10px 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+    margin: 8px 0;
+  }
+  .bubble code {
+    background: #f1f5f9;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  .bubble pre code { background: none; padding: 0; }
+
+  /* 元信息（思考链 / 用量） */
+  .meta {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-sub);
+  }
+  .meta details {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-top: 6px;
+  }
+  .meta summary { cursor: pointer; font-weight: 600; user-select: none; }
+  .chain-step {
+    padding: 4px 0 4px 12px;
+    border-left: 2px solid #d1d5db;
+    margin: 4px 0;
+    color: var(--text);
+  }
+  .chain-step .node-tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 4px;
+    margin-right: 6px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    font-weight: 600;
+  }
+  .badge { font-size: 11px; color: var(--text-sub); margin-left: 8px; }
+
+  .err-bubble { color: #dc2626; }
+
+  /* ========== 输入区 ========== */
+  #input-area {
+    padding: 14px 20px 18px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  #input-box {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  #question {
+    flex: 1;
+    resize: none;
+    min-height: 46px;
+    max-height: 140px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+  }
+  #question:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+  #send-btn {
+    padding: 12px 22px;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  #send-btn:disabled { opacity: .5; cursor: not-allowed; }
+  #hint {
+    font-size: 12px;
+    color: var(--text-sub);
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+
+<!-- 左侧会话栏 -->
+<aside id="sidebar">
+  <header>
+    <h1>🤖 Agent 任务助手</h1>
+    <p>LangGraph ReAct · 工具调度 · 多轮记忆</p>
+  </header>
+  <button id="new-chat-btn">＋ 新建会话</button>
+  <div id="session-list"></div>
+</aside>
+
+<!-- 主聊天区 -->
+<main id="main">
+  <div id="chat-header">
+    <span class="title" id="chat-title">新会话</span>
+    <span id="chat-status"></span>
+  </div>
+  <div id="messages">
+    <div class="empty-tip" id="empty-tip">
+      <div class="big">有什么可以帮你？</div>
+      <div>我可以计算、总结文档、联网搜索，并自动拆解复杂问题。</div>
+      <div>例如：<em>"计算 15 的平方与 3 的立方的和"</em></div>
+    </div>
+  </div>
+  <div id="input-area">
+    <div id="input-box">
+      <textarea id="question" placeholder="输入你的问题，回车发送（Shift+Enter 换行）"></textarea>
+      <button id="send-btn">发送</button>
+    </div>
+    <div id="hint">Agent 会自主选择计算器 / 文档总结 / 网络搜索工具，思考过程与 token 用量均可查看。</div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* ==================== 会话状态管理（localStorage） ====================
+ * 简单前端不依赖后端会话列表接口：会话元数据 + 消息记录全部存浏览器本地。
+ * 每个会话对象：{ id, title, messages: [] }
+ *   id       —— 传给后端 /api/ask 的 session_id，用于续聊加载历史/长期记忆
+ *   title    —— 取首个问题的前 20 字作为会话名
+ *   messages —— 消息数组（user / assistant，助手消息含 chain/tool_calls/usage）
+ */
+const LS_KEY = "agent_chat_sessions";
+const LS_CUR = "agent_chat_current";
+let sessions = loadSessions();
+let currentId = localStorage.getItem(LS_CUR) || null;
+
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; }
+  catch (e) { return []; }
+}
+function saveSessions() {
+  localStorage.setItem(LS_KEY, JSON.stringify(sessions));
+}
+function currentSession() {
+  return sessions.find(s => s.id === currentId) || null;
+}
+
+/* ==================== DOM ==================== */
+const msgEl = document.getElementById("messages");
+const emptyTip = document.getElementById("empty-tip");
+const questionEl = document.getElementById("question");
+const sendBtn = document.getElementById("send-btn");
+const sessionListEl = document.getElementById("session-list");
+const chatTitle = document.getElementById("chat-title");
+const chatStatus = document.getElementById("chat-status");
+
+/* ==================== 渲染 ==================== */
+function esc(str) {
+  return String(str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderChain(chain) {
+  if (!chain || !chain.length) return "";
+  const steps = chain.map(s =>
+    `<div class="chain-step"><span class="node-tag">${esc(s.node || "")}</span>${esc(s.summary || "")}</div>`
+  ).join("");
+  return `<details><summary>🧠 思考链（${chain.length} 步）</summary>${steps}</details>`;
+}
+
+function renderUsage(usage) {
+  if (!usage) return "";
+  return `⏱ 耗时 ${(usage.total_duration_sec || 0).toFixed(2)}s · 🔢 ${usage.total_tokens || 0} tokens · ${usage.total_calls || 0} 次调用`;
+}
+
+function addMessage(role, content, opts = {}) {
+  emptyTip.style.display = "none";
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = role === "user" ? "我" : "AI";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  if (role === "user") {
+    bubble.textContent = content;
+  } else {
+    // 把内容按 ``` 代码块拆分渲染，支持 Markdown 代码块高亮基础展示
+    const parts = String(content).split(/```/);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 1) {
+        const pre = document.createElement("pre");
+        pre.textContent = parts[i];
+        bubble.appendChild(pre);
+      } else if (parts[i]) {
+        const p = document.createElement("div");
+        p.textContent = parts[i];
+        bubble.appendChild(p);
+      }
+    }
+    // 元信息区
+    if (opts.chain || opts.tool_calls || opts.usage) {
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.innerHTML =
+        renderChain(opts.chain) +
+        `<div>🔧 工具调用 ${opts.tool_calls || 0} 次${opts.usage ? " · " + renderUsage(opts.usage) : ""}</div>`;
+      bubble.appendChild(meta);
+    }
+    if (opts.error) {
+      bubble.classList.add("err-bubble");
+    }
+  }
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  msgEl.appendChild(wrap);
+  msgEl.scrollTop = msgEl.scrollHeight;
+}
+
+function renderSessionList() {
+  sessionListEl.innerHTML = "";
+  if (!sessions.length) {
+    const d = document.createElement("div");
+    d.style.cssText = "font-size:12px;color:#6b7280;text-align:center;padding:12px;";
+    d.textContent = "暂无会话，点击上方新建";
+    sessionListEl.appendChild(d);
+    return;
+  }
+  sessions.forEach(s => {
+    const item = document.createElement("div");
+    item.className = "session-item" + (s.id === currentId ? " active" : "");
+    item.textContent = s.title || "(未命名会话)";
+    item.title = s.title;
+    item.onclick = () => switchSession(s.id);
+    sessionListEl.appendChild(item);
+  });
+}
+
+function clearMessages() {
+  msgEl.querySelectorAll(".msg").forEach(n => n.remove());
+  emptyTip.style.display = "";
+}
+
+function switchSession(id) {
+  currentId = id;
+  localStorage.setItem(LS_CUR, id);
+  renderSessionList();
+  clearMessages();
+  const s = currentSession();
+  if (s) {
+    chatTitle.textContent = s.title;
+    s.messages.forEach(m => addMessage(m.role, m.content, m));
+  } else {
+    chatTitle.textContent = "新会话";
+  }
+}
+
+function newSession() {
+  // 生成唯一 session_id（后端以此区分会话，续聊时自动加载记忆）
+  const id = "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  sessions.unshift({ id, title: "新会话", messages: [] });
+  currentId = id;
+  localStorage.setItem(LS_CUR, id);
+  saveSessions();
+  renderSessionList();
+  clearMessages();
+  chatTitle.textContent = "新会话";
+  questionEl.focus();
+}
+
+/* ==================== 发送 ==================== */
+async function send() {
+  const question = questionEl.value.trim();
+  if (!question || sendBtn.disabled) return;
+
+  const sess = currentSession() || newSession();
+  // 首问未命名时更新标题
+  if (sess.messages.length === 0) {
+    sess.title = question.slice(0, 20);
+    chatTitle.textContent = sess.title;
+  }
+  sess.messages.push({ role: "user", content: question });
+  saveSessions();
+  renderSessionList();
+
+  addMessage("user", question);
+  questionEl.value = "";
+  sendBtn.disabled = true;
+  chatStatus.textContent = "思考中…";
+
+  try {
+    const resp = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, session_id: sess.id }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.detail || `请求失败（HTTP ${resp.status}）`);
+    }
+    const answer = {
+      role: "assistant",
+      content: data.answer,
+      chain: data.chain || [],
+      tool_calls: data.tool_calls || 0,
+      usage: data.usage || null,
+      memory_new: data.memory_new || 0,
+    };
+    sess.messages.push(answer);
+    saveSessions();
+    addMessage("assistant", answer.content, answer);
+  } catch (err) {
+    addMessage("assistant", "⚠️ " + err.message, { error: true });
+  } finally {
+    sendBtn.disabled = false;
+    chatStatus.textContent = "";
+  }
+}
+
+/* ==================== 事件绑定 ==================== */
+sendBtn.onclick = send;
+questionEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+document.getElementById("new-chat-btn").onclick = newSession;
+
+/* ==================== 初始化 ==================== */
+if (!sessions.length) {
+  newSession();
+} else {
+  switchSession(currentId || sessions[0].id);
+}
+</script>
+</body>
+</html>

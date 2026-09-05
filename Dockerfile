@@ -42,6 +42,7 @@ COPY tools/ tools/
 COPY agent/ agent/
 COPY memory/ memory/
 COPY api/ api/
+COPY static/ static/
 COPY docs/ docs/
 
 # 3) 创建非 root 运行用户，并赋予日志目录 / 数据目录写权限
