@@ -24,6 +24,12 @@ logs/
 .DS_Store
 Thumbs.db
 
+# 本地记忆数据库（运行时通过卷挂载持久化）
+memory.db
+memory.db-wal
+memory.db-shm
+memory_data/
+
 # 容器/编排文件（无需进入应用镜像）
 Dockerfile
 .dockerignore

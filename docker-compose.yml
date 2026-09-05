@@ -28,6 +28,12 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       ALL_PROXY: ${ALL_PROXY:-}
+      # 记忆数据库写到挂载的数据目录（容器删除后记忆依然保留）
+      AGENT_MEMORY_DB_PATH: /app/memory_data/memory.db
     # 支持交互式对话（保持 stdin/tty）
     stdin_open: true
     tty: true
+    # 记忆持久化：宿主 ./memory_data 目录挂载到容器 /app/memory_data，
+    # 短期+长期对话记忆保存在 memory_data/memory.db，不随容器删除而丢失
+    volumes:
+      - ./memory_data:/app/memory_data

@@ -37,11 +37,13 @@ COPY config/ config/
 COPY core/ core/
 COPY tools/ tools/
 COPY agent/ agent/
+COPY memory/ memory/
 COPY docs/ docs/
 
-# 3) 创建非 root 运行用户，并赋予日志目录写权限
+# 3) 创建非 root 运行用户，并赋予日志目录 / 数据目录写权限
+#    memory_data 用于承载记忆数据库（运行时通过卷挂载持久化）
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p /app/logs \
+    && mkdir -p /app/logs /app/memory_data \
     && chown -R appuser:appuser /app
 USER appuser
 

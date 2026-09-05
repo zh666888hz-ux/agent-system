@@ -79,6 +79,40 @@ class Settings(BaseSettings):
         description="Agent 最大「思考-调用工具」轮数，防止工具循环导致的死循环",
     )
 
+    # ---------- 工具：失败自动重试 ----------
+    tool_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="工具调用失败后的自动重试次数（连续失败超过该值则终止任务并友好提示）",
+    )
+    tool_retry_backoff: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=30,
+        description="工具重试的指数退避基数（秒）：首次等待 1s，之后 2s、4s ... 翻倍",
+    )
+
+    # ---------- 记忆系统 ----------
+    memory_enabled: bool = Field(
+        default=True,
+        description="是否启用记忆系统（短期会话记忆 + 长期跨会话记忆）",
+    )
+    memory_db_path: Path = Field(
+        default=PROJECT_ROOT / "memory.db",
+        description="记忆数据库路径（SQLite 单文件）",
+    )
+    memory_extract: bool = Field(
+        default=True,
+        description="是否在每轮对话后用 LLM 提炼长期记忆（关闭可省 token）",
+    )
+    memory_inject_limit: int = Field(
+        default=20,
+        ge=0,
+        le=100,
+        description="每次注入 Agent 上下文的长期记忆条数上限",
+    )
+
     # ---------- 工具：网络搜索 ----------
     search_engine: str = Field(
         default="bing",

@@ -24,3 +24,9 @@ Thumbs.db
 # ---- 本地测试产物 ----
 *.tmp
 *.bak
+
+# ---- 本地记忆数据库（含用户对话记录，不入库）----
+memory.db
+memory.db-wal
+memory.db-shm
+memory_data/

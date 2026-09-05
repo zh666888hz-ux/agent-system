@@ -18,8 +18,10 @@ import argparse
 import sys
 
 from agent.graph import run_agent
+from config.settings import get_settings
 from core.exceptions import AgentError
 from core.logging import get_logger, setup_logging
+from memory.repository import MemoryRepository
 
 logger = get_logger("main")
 
@@ -44,6 +46,17 @@ def parse_args() -> argparse.Namespace:
         help="不打印思考链（默认打印每一步思考/工具调用过程）",
     )
     parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="会话 ID（短期记忆载体）。同一会话连续提问可保持对话上下文；不传则新建",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="列出历史会话并退出",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default=None,
@@ -59,24 +72,50 @@ def print_result(result: dict) -> None:
     print("=" * 60)
     print(result["answer"])
     print("=" * 60)
-    print(f"本次共调用工具 {result['tool_calls']} 次，思考链 {len(result['chain'])} 步")
+    print(f"本次共调用工具 {result['tool_calls']} 次，思考链 {len(result['chain'])} 步"
+          + (f"，新增长期记忆 {result.get('memory_new', 0)} 条" if result.get("memory_new") else ""))
+    if result.get("aborted"):
+        print("⚠ 任务因工具连续失败而终止")
     print("=" * 60 + "\n")
 
 
 def main() -> int:
     args = parse_args()
     setup_logging(level=args.log_level)
+    settings = get_settings()
+
+    # 记忆仓库：进程内复用一次（内部缓存数据库连接池与建表）
+    repo: MemoryRepository | None = None
+    if settings.memory_enabled:
+        repo = MemoryRepository(settings.memory_db_path)
 
     try:
+        # ---------- 列出历史会话 ----------
+        if args.list_sessions:
+            sessions = repo.list_sessions(20) if repo else []
+            print(f"\n共 {len(sessions)} 个会话：")
+            for s in sessions:
+                print(f"  {s['id']}  |  {s['title'] or '(无标题)'}  |  {s['updated_at']}")
+            return 0
+
         # ---------- 单次提问模式 ----------
         if args.question:
-            result = run_agent(args.question, show_chain=not args.no_chain)
+            result = run_agent(
+                args.question,
+                session_id=args.session,
+                repository=repo,
+                show_chain=not args.no_chain,
+            )
             print_result(result)
+            print(f"会话 ID: {result['session_id']}（下次提问加 --session 可续聊）")
             return 0
 
         # ---------- 交互式对话模式 ----------
         print("ReAct 智能体已启动（输入 exit / quit / 退出 结束对话）")
         print("试试：计算 (1234*56+789)/3  或  总结一段文本  或  搜索某话题\n")
+
+        # 交互式：沿用同一会话，跨轮保持短期记忆
+        session_id = args.session
         while True:
             try:
                 question = input("你: ").strip()
@@ -89,7 +128,13 @@ def main() -> int:
                 print("再见！")
                 break
             try:
-                result = run_agent(question, show_chain=not args.no_chain)
+                result = run_agent(
+                    question,
+                    session_id=session_id,
+                    repository=repo,
+                    show_chain=not args.no_chain,
+                )
+                session_id = result["session_id"]  # 之后的轮次沿用此会话
                 print_result(result)
             except AgentError as exc:
                 logger.error("Agent 执行失败: %s", exc)

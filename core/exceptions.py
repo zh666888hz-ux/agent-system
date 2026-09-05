@@ -48,3 +48,18 @@ class SearchError(ToolExecutionError):
 
 class DocumentReadError(ToolExecutionError):
     """文档读取/解析失败：文件不存在、编码异常、大小超限等。"""
+
+
+class RetryExhaustedError(AgentError):
+    """重试耗尽：工具/操作连续失败超过重试上限后抛出，用于终止任务并友好降级。"""
+
+    def __init__(
+        self,
+        message: str,
+        attempts: int = 0,
+        tool_name: str = "",
+        cause: Exception | None = None,
+    ):
+        super().__init__(message, cause)
+        self.attempts = attempts
+        self.tool_name = tool_name

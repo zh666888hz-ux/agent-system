@@ -92,6 +92,36 @@ langgraph-react-agent/
 finalize 节点会清理「已请求但未执行」的孤儿 tool_calls 消息，保证发给 LLM 的消息序列
 符合 OpenAI 工具调用协议（避免 400 错误），并如实告知用户已达上限、基于已有结果作答。
 
+### 记忆系统（短期会话记忆 + 长期跨会话记忆）
+
+对话记忆用 SQLite（零配置单文件，标准库实现）持久化，三张表：
+
+| 表 | 类型 | 内容 |
+|---|---|---|
+| `conversations` | 会话 | 会话 ID、标题（自动取首问前 30 字）、时间 |
+| `messages` | 短期记忆 | 每轮「用户提问 + Agent 回答」Q/A 对 |
+| `long_term_memories` | 长期记忆 | 跨会话的持久事实（用户偏好 / 关注领域等） |
+
+- **短期记忆**：同一 `session_id` 连续提问时，自动加载历史 Q/A 对拼入上下文，实现多轮对话记忆；
+- **长期记忆**：每轮对话结束后，用 LLM 提炼「值得长期记住的信息」（记忆巩固），去重后入库；
+  新会话开始时自动注入系统提示词，让 Agent 冷启动也能"记得"用户是谁；
+- **CLI 支持**：`--session <id>` 指定会话续聊、`--list-sessions` 查看历史会话。
+
+### 工具失败自动重试
+
+生产环境中工具调用常因网络抖动 / 远端临时故障而失败。本项目内置重试机制：
+
+- 工具调用失败后按 `AGENT_TOOL_MAX_RETRIES`（默认 2 次）自动重试；
+- 重试间隔**指数退避**（`AGENT_TOOL_RETRY_BACKOFF` 基数：1s → 2s → 4s ...），给远端恢复时间；
+- **连续失败终止**：超过重试上限后进入 abort 节点，生成**友好提示**（含失败工具名、
+  已尝试次数、可能原因、建议），而不是抛裸堆栈或让 Agent 无限重试；
+- 每次失败 / 重试 / 终止都记录详细日志，便于排查。
+
+### 完整运行日志
+
+全流程可审计，覆盖：会话生命周期（创建/复用/完成）、短期记忆加载、长期记忆注入与提炼、
+模型思考、工具选择、工具执行与耗时、失败重试、上限收敛、任务终止、最终答案。
+
 ---
 
 ## 三、内置工具
@@ -151,6 +181,11 @@ python main.py
 # 5. 其他参数
 python main.py --question "..." --no-chain   # 不打印思考链
 python main.py --question "..." --log-level DEBUG
+
+# 6. 多轮会话记忆
+python main.py --question "我的专业是软件工程" --session my-session   # 指定会话
+python main.py --question "还记得我专业吗？" --session my-session      # 续聊：自动加载历史+长期记忆
+python main.py --list-sessions                                         # 查看历史会话
 ```
 
 ### 关键配置（.env）
@@ -162,6 +197,10 @@ python main.py --question "..." --log-level DEBUG
 | `AGENT_CHAT_MODEL` | `deepseek-chat` | 对话模型名 |
 | `AGENT_LLM_TIMEOUT` / `AGENT_LLM_MAX_RETRIES` | 60 / 3 | LLM 超时与重试 |
 | `AGENT_MAX_ITERATIONS` | 8 | Agent 最大思考-调用轮数（防死循环） |
+| `AGENT_TOOL_MAX_RETRIES` / `AGENT_TOOL_RETRY_BACKOFF` | 2 / 1.0 | 工具失败重试次数与退避基数 |
+| `AGENT_MEMORY_ENABLED` | `true` | 是否启用记忆系统 |
+| `AGENT_MEMORY_DB_PATH` | `memory.db` | 记忆数据库路径 |
+| `AGENT_MEMORY_EXTRACT` / `AGENT_MEMORY_INJECT_LIMIT` | `true` / 20 | 长期记忆提炼开关 / 注入条数上限 |
 | `AGENT_SEARCH_ENGINE` | `bing` | bing / wikipedia / duckduckgo |
 | `AGENT_LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
@@ -185,7 +224,21 @@ docker run --rm --env-file .env react-agent python main.py --question "计算 2*
 
 # 交互式对话（-it 保持终端）
 docker run --rm -it --env-file .env react-agent
+
+# 多轮会话记忆（挂载数据目录，持久化记忆数据库）
+docker run --rm --env-file .env \
+  -v "$(pwd)/memory_data:/app/memory_data" \
+  -e AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db \
+  react-agent python main.py --question "我的专业是软件工程" --session my-session
+docker run --rm --env-file .env \
+  -v "$(pwd)/memory_data:/app/memory_data" \
+  -e AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db \
+  react-agent python main.py --question "还记得我专业吗？" --session my-session
 ```
+
+> **记忆持久化**：容器内 `memory.db` 默认写在容器文件系统，容器删除即丢失。
+> 挂载数据目录（`-v 宿主机目录:/app/memory_data`）并设置
+> `AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` 即可持久化对话记忆。
 
 ### 3. 使用 Docker Compose（推荐，统一管理）
 
@@ -194,6 +247,9 @@ docker compose build
 docker compose run --rm agent python main.py --question "计算 2**10"   # 单次
 docker compose run --rm agent                                           # 交互式
 ```
+
+> Compose 已内置：`AGENT_MEMORY_DB_PATH=/app/memory_data/memory.db` +
+> 卷挂载 `./memory_data:/app/memory_data`，开箱即用记忆持久化。
 
 ### 4. 网络代理说明（重要）
 

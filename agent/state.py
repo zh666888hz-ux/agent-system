@@ -27,7 +27,10 @@ class AgentState(TypedDict):
         tool_calls: 已执行的工具调用累计次数（防无限循环的核心计数器）。
                     tools 节点每次执行后自增；agent / finalize 节点不修改它。
                     当达到 AGENT_MAX_ITERATIONS 上限时，条件边强制结束工具循环。
+        abort_reason: 工具连续失败超过重试上限时写入的终止原因（非空即终止）。
+                      由条件边检测后路由到 abort 节点，生成友好提示。
     """
 
     messages: Annotated[list, add_messages]
     tool_calls: int
+    abort_reason: str
