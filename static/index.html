@@ -408,12 +408,11 @@ function switchSession(id) {
 }
 
 function newSession() {
-  // 生成唯一 session_id（后端以此区分会话，续聊时自动加载记忆）
-  const id = "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
-  sessions.unshift({ id, title: "新会话", messages: [] });
-  currentId = id;
-  localStorage.setItem(LS_CUR, id);
-  saveSessions();
+  // 「草稿模式」：只清空聊天区等待输入，不生成 session_id、不写入会话列表。
+  // 只有真正发送第一条消息时（见 send()）才会创建会话记录——
+  // 避免用户反复点击「新建会话」却未对话时，堆积大量无内容空会话。
+  currentId = null;
+  localStorage.setItem(LS_CUR, "");
   renderSessionList();
   clearMessages();
   chatTitle.textContent = "新会话";
@@ -425,7 +424,14 @@ async function send() {
   const question = questionEl.value.trim();
   if (!question || sendBtn.disabled) return;
 
-  const sess = currentSession() || newSession();
+  // 草稿模式（当前无会话）：首条消息到达时才真正创建会话。
+  // session_id 在此刻生成并持久化；若始终不对话，则不留下任何会话记录。
+  if (!currentId) {
+    currentId = "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    sessions.unshift({ id: currentId, title: question.slice(0, 20), messages: [] });
+    localStorage.setItem(LS_CUR, currentId);
+  }
+  const sess = currentSession();
   // 首问未命名时更新标题
   if (sess.messages.length === 0) {
     sess.title = question.slice(0, 20);
@@ -480,10 +486,12 @@ questionEl.addEventListener("keydown", e => {
 document.getElementById("new-chat-btn").onclick = newSession;
 
 /* ==================== 初始化 ==================== */
-if (!sessions.length) {
-  newSession();
+if (sessions.length) {
+  // 校验 localStorage 中记录的当前会话仍有效，否则回退到第一个会话
+  const valid = currentId && sessions.some(s => s.id === currentId);
+  switchSession(valid ? currentId : sessions[0].id);
 } else {
-  switchSession(currentId || sessions[0].id);
+  newSession();   // 无历史会话时进入草稿模式（不产生空会话）
 }
 </script>
 </body>
