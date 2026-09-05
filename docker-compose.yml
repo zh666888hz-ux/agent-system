@@ -1,0 +1,33 @@
+# ============================================================
+# LangGraph ReAct Agent - Docker Compose 编排
+#
+# 用法：
+#   1. 复制 .env.example 为 .env 并填写 AGENT_OPENAI_API_KEY
+#   2. docker compose build          # 构建镜像
+#   3. docker compose run --rm agent python main.py --question "计算 2**10"
+#      docker compose run --rm agent  # 交互式对话（Ctrl+D / exit 退出）
+#
+# 说明：
+#   - 该应用为 CLI 形态（非常驻服务），用 compose 统一管理镜像与环境变量即可，
+#     不需要 restart 常驻策略。
+#   - 敏感配置通过 env_file (.env) 注入，.env 已被 .dockerignore 排除不进镜像。
+#   - 可选代理：Docker NAT 出口 IP 可能被搜索引擎降级导致结果异常，
+#     在宿主环境变量设置 HTTP_PROXY/HTTPS_PROXY 可透传给容器（如走本机 Clash）。
+# ============================================================
+name: react-agent
+
+services:
+  agent:
+    build: .
+    image: react-agent:latest
+    container_name: react-agent
+    env_file:
+      - .env
+    environment:
+      # 可选：把宿主代理透传给容器（requests 自动读取），修复容器内搜索降级
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+    # 支持交互式对话（保持 stdin/tty）
+    stdin_open: true
+    tty: true

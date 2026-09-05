@@ -1,0 +1,20 @@
+# ============================================================
+# LangGraph ReAct Agent 依赖清单
+# 安装：pip install -r requirements.txt
+# 建议在独立虚拟环境中安装（见 README）
+# ============================================================
+
+# ---- LangChain / LangGraph 核心 ----
+langgraph>=1.0
+langchain-core>=1.0
+langchain-openai>=1.0
+
+# ---- 配置与校验 ----
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# ---- 网络搜索 ----
+requests>=2.31
+
+# ---- 可选：dotenv（pydantic-settings 已内置支持，可省略）----
+# python-dotenv>=1.0
